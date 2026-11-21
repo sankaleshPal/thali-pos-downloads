@@ -1,0 +1,100 @@
+name: Windows installer upgrade
+on:
+  workflow_dispatch:
+    inputs:
+      baselineTag:
+        required: true
+        description: Release tag for the previous full installer
+      candidateTag:
+        required: true
+        description: Draft release tag for the new full installer
+      baselineSha256:
+        required: true
+        description: SHA256 of the previously verified installer
+      candidateSha256:
+        required: true
+        description: SHA256 of the exact candidate
+permissions:
+  contents: read
+jobs:
+  upgrade:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - name: Download both release assets and verify their hashes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OLD_TAG: ${{ inputs.baselineTag }}
+          NEW_TAG: ${{ inputs.candidateTag }}
+          OLD_HASH: ${{ inputs.baselineSha256 }}
+          NEW_HASH: ${{ inputs.candidateSha256 }}
+        run: |
+          foreach ($v in 'OLD','NEW') {
+            $tag = [Environment]::GetEnvironmentVariable($v + '_TAG')
+            $hash = [Environment]::GetEnvironmentVariable($v + '_HASH')
+            if ($tag -notmatch '^[a-zA-Z0-9][a-zA-Z0-9.-]*$' -or $hash -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid release input' }
+            gh release download $tag --repo $env:REPO --pattern Thali-POS-Setup.exe --output "$v.exe"
+            if ($LASTEXITCODE -ne 0 -or (Get-FileHash "$v.exe").Hash -ne $hash) { throw 'Installer download or digest check failed' }
+          }
+      - name: Install, seed a scratch restaurant, upgrade and verify persisted data
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = 'C:\ThaliUpgradeTest'
+          $exe = Join-Path $install 'Thali POS.exe'
+          function Install-Thali($file) {
+            $run = Start-Process (Resolve-Path $file) -ArgumentList '/S',"/D=$install" -Wait -PassThru
+            if ($run.ExitCode -ne 0 -or !(Test-Path $exe)) { throw "Install failed: $file ($($run.ExitCode))" }
+            (Get-Item $exe).VersionInfo.ProductVersion
+          }
+          function Start-Thali {
+            Start-Process $exe
+            foreach ($attempt in 1..60) {
+              try { if ((Invoke-WebRequest 'http://127.0.0.1:3333/ping' -TimeoutSec 2).StatusCode -eq 200) { return } } catch {}
+              Start-Sleep 2
+            }
+            throw 'Installed application did not start the local server'
+          }
+          function Stop-Thali {
+            Get-Process -Name 'Thali POS' -ErrorAction SilentlyContinue | Where-Object Path -eq $exe | Stop-Process -Force
+            Start-Sleep 3
+          }
+          $old = Install-Thali OLD.exe
+          Start-Thali
+          Stop-Thali
+          $db = @('Thali POS','thali-pos','Thali') | ForEach-Object { Join-Path $env:LOCALAPPDATA "$_\data\thali.sqlite" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (!$db) { throw 'Baseline database not found' }
+          $licenseDir = Join-Path $env:APPDATA 'Thali\license'
+          New-Item -ItemType Directory -Force $licenseDir | Out-Null
+          $license = Join-Path $licenseDir 'thali.license'
+          Set-Content $license '{"testFixture":"upgrade-preservation"}' -NoNewline
+          $hash = (Get-FileHash $license).Hash
+          $backup = Join-Path (Split-Path (Split-Path $db)) 'backups\upgrade-test.thalibak'
+          New-Item -Type Directory -Force (Split-Path $backup) | Out-Null
+          Set-Content $backup 'synthetic backup marker' -NoNewline
+          $backupHash = (Get-FileHash $backup).Hash
+          @'
+          import sqlite3, sys
+          with sqlite3.connect(sys.argv[1]) as db:
+              db.execute("PRAGMA foreign_keys=ON")
+              db.execute("INSERT INTO outlet_admins(id,email) VALUES (?,?)", ("a"*24,"qa@example.invalid"))
+              db.execute("INSERT INTO outlets(id,name,outletAdminId) VALUES (?,?,?)", ("b"*24,"Upgrade QA","a"*24))
+              db.execute("INSERT INTO app_settings(key,value,updatedAt) VALUES (?,?,?)", ("qa.marker","42",1))
+          '@ | python - $db
+          if ($LASTEXITCODE -ne 0) { throw 'Could not seed scratch data' }
+          $new = Install-Thali NEW.exe
+          if ([version]$new -le [version]$old) { throw "Expected a newer installer, got $old -> $new" }
+          Start-Thali
+          if ((Get-FileHash $license).Hash -ne $hash -or (Get-FileHash $backup).Hash -ne $backupHash) { throw 'Licence or backup changed' }
+          @'
+          import sqlite3, sys
+          with sqlite3.connect(sys.argv[1]) as db:
+              assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+              assert db.execute("SELECT name FROM outlets WHERE id=?", ("b"*24,)).fetchone() == ("Upgrade QA",)
+              assert db.execute("SELECT value FROM app_settings WHERE key='qa.marker'").fetchone() == ("42",)
+          '@ | python - $db
+          if ($LASTEXITCODE -ne 0) { throw 'Scratch data did not survive upgrade' }
+          Stop-Thali
+          Write-Host "Verified Windows upgrade $old -> $new"
