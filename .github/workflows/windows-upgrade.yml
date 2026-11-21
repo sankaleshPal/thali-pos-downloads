@@ -46,32 +46,31 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 18
-    # Downloads run with read-only access. No source is checked out.
+    # Draft links grant temporary read access to one file. No repo token or source is needed.
     permissions:
-      contents: read
+      contents: none
     steps:
       - name: Download both release assets and verify their hashes
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          OLD_LINK: ${{ secrets.QA_BASELINE_DOWNLOAD }}
+          NEW_LINK: ${{ secrets.QA_CANDIDATE_DOWNLOAD }}
           REPO: ${{ github.repository }}
           OLD_TAG: ${{ inputs.baselineTag }}
           NEW_TAG: ${{ inputs.candidateTag }}
           OLD_HASH: ${{ inputs.baselineSha256 }}
           NEW_HASH: ${{ inputs.candidateSha256 }}
         run: |
-          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'Thali-upgrade-test' }
-          $releases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:REPO/releases?per_page=100"
           foreach ($v in 'OLD','NEW') {
             $tag = [Environment]::GetEnvironmentVariable($v + '_TAG')
             $hash = [Environment]::GetEnvironmentVariable($v + '_HASH')
             if ($tag -notmatch '^[a-zA-Z0-9][a-zA-Z0-9.-]*$' -or $hash -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid release input' }
-            $release = $releases | Where-Object tag_name -ceq $tag | Select-Object -First 1
-            $asset = $release.assets | Where-Object name -ceq 'Thali-POS-Setup.exe' | Select-Object -First 1
-            if (!$asset -or $asset.digest -ne "sha256:$hash") { throw "Draft asset or digest not found for $tag" }
-            $binaryHeaders = $headers.Clone()
-            $binaryHeaders.Accept = 'application/octet-stream'
-            Invoke-WebRequest -Headers $binaryHeaders -Uri "https://api.github.com/repos/$env:REPO/releases/assets/$($asset.id)" -OutFile "$v.exe"
+            $link = [Environment]::GetEnvironmentVariable($v + '_LINK')
+            if ($link) {
+              $uri = [uri]$link
+              if ($uri.Scheme -ne 'https' -or $uri.Host -ne 'release-assets.githubusercontent.com') { throw 'Expected a GitHub release asset' }
+            } else { $link = "https://github.com/$env:REPO/releases/download/$tag/Thali-POS-Setup.exe" }
+            try { Invoke-WebRequest -Uri $link -OutFile "$v.exe" } catch { throw "Could not download $tag. Refresh its draft link." }
             if ((Get-FileHash "$v.exe").Hash -ne $hash) { throw 'Installer digest check failed' }
           }
       - name: Install, seed a scratch restaurant, upgrade and verify persisted data
