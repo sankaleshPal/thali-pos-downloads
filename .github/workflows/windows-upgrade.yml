@@ -82,14 +82,27 @@ jobs:
           function Install-Thali($file) {
             $run = Start-Process (Resolve-Path $file) -ArgumentList '/S',"/D=$install" -Wait -PassThru
             if ($run.ExitCode -ne 0 -or !(Test-Path $exe)) { throw "Install failed: $file ($($run.ExitCode))" }
-            (Get-Item $exe).VersionInfo.ProductVersion
+            $version = (Get-Item $exe).VersionInfo.ProductVersion
+            Write-Host "Installed $file, product version $version"
+            $version
           }
           function Start-Thali {
-            Start-Process $exe
-            foreach ($attempt in 1..60) {
-              try { if ((Invoke-WebRequest 'http://127.0.0.1:3333/ping' -TimeoutSec 2).StatusCode -eq 200) { return } } catch {}
+            $stderr = Join-Path $env:RUNNER_TEMP "thali-$([guid]::NewGuid()).log"
+            $process = Start-Process $exe -PassThru -RedirectStandardError $stderr
+            foreach ($attempt in 1..30) {
+              try { if ((Invoke-RestMethod 'http://127.0.0.1:3333/ping' -NoProxy -TimeoutSec 2).message -eq 'pong') { return } } catch {}
               Start-Sleep 2
             }
+            Write-Host "Process exited: $($process.HasExited)"
+            foreach ($root in @($env:LOCALAPPDATA,$env:APPDATA)) {
+              foreach ($dir in (Get-ChildItem $root -Directory -Filter '*thali*')) {
+                Write-Host "Found app directory $($dir.Name)"
+                foreach ($file in (Get-ChildItem "$($dir.FullName)/logs" -File -ErrorAction SilentlyContinue)) {
+                  Get-Content $file.FullName -Tail 60 | Select-String 'error|exception|failed|cannot|MODULE_NOT_FOUND|NODE_MODULE_VERSION' | Select-Object -Last 12 | ForEach-Object { Write-Host $_.Line }
+                }
+              }
+            }
+            Get-Content $stderr -Tail 16
             throw 'Installed application did not start the local server'
           }
           function Stop-Thali {
