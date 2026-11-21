@@ -77,6 +77,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Set-TimeZone -Id 'India Standard Time'
+          $env:TZ = 'Asia/Kolkata'
           $install = 'C:\ThaliUpgradeTest'
           $exe = Join-Path $install 'Thali POS.exe'
           function Install-Thali($file) {
